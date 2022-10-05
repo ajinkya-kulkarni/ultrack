@@ -3,12 +3,12 @@ from typing import Dict, Tuple
 import numpy as np
 
 from ultrack.config import TrackingConfig
-from ultrack.core.tracking.solver import GurobiSolver, HeuristicSolver
+from ultrack.core.tracking.solver import CVXPySolver, GurobiSolver, HeuristicSolver
 
 
 class SolverSuite:
     params = [
-        ["gurobi", "heuristic"],
+        ["cvxpy", "gurobi", "heuristic"],
         [
             (10, 100, 5, 5),
             (10, 1_000, 5, 5),
@@ -18,12 +18,16 @@ class SolverSuite:
         ],
     ]
 
-    timeout = 3600  # 1 hour timeout
+    timeout = 120  # 2 mins timeout, problem are not that large
 
     # params = length, n_nodes_per_time, n_neighbors, n_overlaps
     param_names = ["solver_class", "params"]
 
-    _SOLVER_CLASS = {"gurobi": GurobiSolver, "heuristic": HeuristicSolver}
+    _SOLVER_CLASS = {
+        "cvxpy": CVXPySolver,
+        "gurobi": GurobiSolver,
+        "heuristic": HeuristicSolver,
+    }
 
     def setup(self, solver: str, params: Tuple[int]) -> None:
         length, n_nodes_per_time, n_neighbors, n_overlaps = params

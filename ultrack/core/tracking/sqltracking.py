@@ -4,13 +4,23 @@ from typing import Tuple
 
 import pandas as pd
 import sqlalchemy as sqla
+from rich import print
 from sqlalchemy.orm import Session
 
 from ultrack.config.dataconfig import DataConfig
 from ultrack.config.trackingconfig import TrackingConfig
 from ultrack.core.database import NO_PARENT, LinkDB, NodeDB, OverlapDB, maximum_time
-from ultrack.core.tracking.solver import GurobiSolver
 from ultrack.core.tracking.solver.base_solver import BaseSolver
+
+try:
+    from ultrack.core.tracking.solver import GurobiSolver as Solver
+
+except Exception as e:
+    print(e)
+    print("Using [green]cvxpy[/green] solver instead.")
+    print("[red]Install Gurobi for [bold]BEST[/bold] performance![/red]")
+    from ultrack.core.tracking.solver import CVXPySolver as Solver
+
 
 logging.basicConfig()
 logging.getLogger("sqlachemy.engine").setLevel(logging.INFO)
@@ -60,7 +70,7 @@ class SQLTracking:
             )
 
         LOG.info(f"Tracking batch {index}")
-        solver = GurobiSolver(self._tracking_config)
+        solver = Solver(self._tracking_config)
 
         self._add_nodes(solver=solver, index=index)
         self._add_edges(solver=solver, index=index)

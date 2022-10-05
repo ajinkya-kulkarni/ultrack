@@ -7,9 +7,10 @@ from gurobipy import GRB
 from numpy.typing import ArrayLike
 
 from ultrack.config.config import TrackingConfig
-from ultrack.core.database import NO_PARENT
 from ultrack.core.tracking.solver.base_solver import BaseSolver
+from ultrack.core.tracking.solver.utils import indices_to_solution_dataframe
 
+gp.Model()  # forcing to check license
 LOG = logging.getLogger(__name__)
 
 
@@ -175,7 +176,7 @@ class GurobiSolver(BaseSolver):
         return self._model.getObjective().getValue()
 
     def solution(self) -> pd.DataFrame:
-        """Returns the nodes present on the solution.
+        """Returns the solution as dataframe.
 
         Returns
         -------
@@ -190,29 +191,5 @@ class GurobiSolver(BaseSolver):
             )
 
         nodes = [k for k, var in self._nodes.items() if var.X > 0.5]
-        LOG.info(f"Solution nodes\n{nodes}")
-
-        if len(nodes) == 0:
-            raise ValueError("Something went wrong, nodes solution is empty.")
-
-        nodes = pd.DataFrame(
-            data=NO_PARENT,
-            index=nodes,
-            columns=["parent_id"],
-        )
-
-        inv_edges = np.asarray([k for k, var in self._edges.items() if var.X > 0.5])
-        LOG.info(f"Solution edges\n{inv_edges}")
-
-        if len(inv_edges) == 0:
-            raise ValueError("Something went wrong, edges solution is empty")
-
-        inv_edges = pd.DataFrame(
-            data=inv_edges[:, 0],
-            index=inv_edges[:, 1],
-            columns=["parent_id"],
-        )
-
-        nodes.update(inv_edges)
-
-        return nodes
+        edges = np.asarray([k for k, var in self._edges.items() if var.X > 0.5])
+        return indices_to_solution_dataframe(nodes, edges)

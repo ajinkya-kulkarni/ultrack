@@ -6,6 +6,7 @@ import pytest
 
 from ultrack.config.config import MainConfig
 from ultrack.core.tracking.solver.base_solver import BaseSolver
+from ultrack.core.tracking.solver.cvxpy_solver import CVXPySolver
 from ultrack.core.tracking.solver.gurobi_solver import GurobiSolver
 from ultrack.core.tracking.solver.heuristic.heuristic_solver import HeuristicSolver
 
@@ -14,7 +15,7 @@ from ultrack.core.tracking.solver.heuristic.heuristic_solver import HeuristicSol
     "solver,config_content",
     list(
         product(
-            [GurobiSolver, HeuristicSolver],
+            [CVXPySolver, GurobiSolver, HeuristicSolver],
             [
                 {
                     "tracking.appear_weight": -0.25,
