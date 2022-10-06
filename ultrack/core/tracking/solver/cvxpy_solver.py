@@ -1,67 +1,18 @@
 import logging
-from typing import List
 
 import cvxpy as cp
 import numpy as np
 import pandas as pd
 from cvxpy.expressions.expression import Expression
 from numpy.typing import ArrayLike
-from tqdm import tqdm
+from scipy import sparse
+from skimage.util._map_array import ArrayMap
 
 from ultrack.config.config import TrackingConfig
 from ultrack.core.tracking.solver.base_solver import BaseSolver
 from ultrack.core.tracking.solver.utils import indices_to_solution_dataframe
 
 LOG = logging.getLogger(__name__)
-
-
-class CVXPyNode:
-    def __init__(
-        self,
-        appear_weight: float,
-        disappear_weight: float,
-        division_weight: float,
-    ) -> None:
-        """Helper class for objective oriented problem construction."""
-        self.node_var = cp.Variable(boolean=True)
-        self._appear_var = cp.Variable(boolean=True)
-        self._disappear_var = cp.Variable(boolean=True)
-        self._division_var = cp.Variable(boolean=True)
-        self._appear_weight = cp.Parameter()
-        self._appear_weight.value = appear_weight
-        self._disappear_weight = cp.Parameter()
-        self._disappear_weight.value = disappear_weight
-        self._division_weight = cp.Parameter()
-        self._division_weight.value = division_weight
-        self._in_edges = []
-        self._out_edges = []
-
-    def add_in_edge(self, edge: cp.Variable) -> None:
-        self._in_edges.append(edge)
-
-    def add_out_edge(self, edge: cp.Variable) -> None:
-        self._out_edges.append(edge)
-
-    @property
-    def constraints(self) -> List[Expression]:
-        """Single-incoming node, flow conservation and division constraints for a single node."""
-        return [
-            # single incoming node
-            cp.sum(self._in_edges) + self._appear_var == self.node_var,
-            # flow conservation
-            self.node_var + self._division_var
-            == cp.sum(self._out_edges) + self._disappear_var,
-            self.node_var >= self._division_var,  # existance division
-        ]
-
-    @property
-    def objective(self) -> Expression:
-        """Objective variable per node."""
-        return (
-            self._appear_weight * self._appear_var
-            + self._disappear_weight * self._disappear_var
-            + self._division_weight * self._division_var
-        )
 
 
 class CVXPySolver(BaseSolver):
@@ -78,13 +29,13 @@ class CVXPySolver(BaseSolver):
         """
 
         self._config = config
+        self._n_slack_vars = 4
         self.reset()
 
     def reset(self) -> None:
         """Sets model to an empty state."""
-        self._nodes = {}
-        self._edges = []
-        self._edges_keys = []
+        self._n_nodes = 0
+        self._n_edges = 0
         self._constraints = []
         self._weights = None
         self._problem = None
@@ -103,7 +54,7 @@ class CVXPySolver(BaseSolver):
         is_last_t : ArrayLike
             Boolean array indicating if it belongs to last time point and it won't receive disappearance penalization.
         """
-        if len(self._nodes) > 0:
+        if self._n_nodes > 0:
             raise ValueError("Nodes have already been added.")
 
         self._assert_same_length(
@@ -116,16 +67,20 @@ class CVXPySolver(BaseSolver):
         appear_weight = np.logical_not(is_first_t) * self._config.appear_weight
         disappear_weight = np.logical_not(is_last_t) * self._config.disappear_weight
 
-        indices = indices.tolist()
+        self._backward_map = np.array(indices, copy=True)
+        self._forward_map = ArrayMap(np.asarray(indices), np.arange(len(indices)))
+        self._n_nodes = len(self._backward_map)
 
-        self._nodes = {
-            index: CVXPyNode(a_w, d_w, self._config.division_weight)
-            for index, a_w, d_w in tqdm(
-                zip(indices, appear_weight, disappear_weight),
-                "Adding nodes to solver",
-                total=len(indices),
-            )
-        }
+        self._weights = np.concatenate(
+            (
+                np.zeros(self._n_nodes),
+                appear_weight,
+                disappear_weight,
+                np.full(self._n_nodes, self._config.division_weight),
+            ),
+            axis=0,
+            dtype=np.float32,
+        )
 
     def add_edges(
         self, sources: ArrayLike, targets: ArrayLike, weights: ArrayLike
@@ -141,41 +96,102 @@ class CVXPySolver(BaseSolver):
         weights : ArrayLike
             Array of weights, input to the link function.
         """
-        if len(self._edges) > 0:
+        if self._n_edges > 0:
             raise ValueError("Edges have already been added.")
 
         self._assert_same_length(sources=sources, targets=targets, weights=weights)
 
-        self._weights = self._config.apply_link_function(weights)
+        weights = self._config.apply_link_function(weights)
 
-        LOG.info(f"transformed edge weights {self._weights}")
+        LOG.info(f"transformed edge weights {weights}")
+        self._weights = np.concatenate(
+            (self._weights, weights),
+            axis=0,
+            dtype=np.float32,
+        )
+        self._weights = cp.Parameter(len(self._weights), value=self._weights)
 
-        self._edges = cp.Variable(len(self._weights), boolean=True)
+        self._out_edges = self._forward_map[np.asarray(sources)]
+        self._in_edges = self._forward_map[np.asarray(targets)]
+        self._n_edges = len(self._out_edges)
 
-        self._edges_keys = []
-        for i, (s, t) in tqdm(
-            enumerate(zip(sources, targets)),
-            "Adding edges to solver",
-            total=len(self._weights),
-        ):
-            edge = self._edges[i]
-            self._nodes[t].add_in_edge(edge)
-            self._nodes[s].add_out_edge(edge)
-            self._edges_keys.append((s, t))
+        # n_nodes x 4 + n_edges
+        size = self._n_slack_vars * self._n_nodes + self._n_edges
+
+        # (nodes, appear, disappear, division, edges)
+        self._variables = cp.Variable(size, boolean=True)
+        self._shape = (self._n_nodes, size)
+
+    def _sparse_nodes_ids_eye_matrix(self, offset: int = 0) -> sparse.csr_matrix:
+        """Creates a sparse rectangular identity matrix of size (n_nodes, n_vars)
+
+        Parameters
+        ----------
+        offset : int, optional
+            Diagonal offset, it's multiplied by n_nodes, by default 0
+
+        Returns
+        -------
+        sparse.csr_matrix
+            Compressed row sparse matrix of shape (n_nodes, n_vars)
+        """
+        node_ids = np.arange(self._n_nodes)
+        values = np.ones(self._n_nodes, dtype=np.float32)
+        return sparse.csr_matrix(
+            (values, (node_ids, offset * self._n_nodes + node_ids)),
+            shape=self._shape,
+        )
+
+    def _single_in_edge_constraint(self) -> Expression:
+        """Creates a contraint such that there's only a single in coming link per node."""
+        in_edges = sparse.csr_matrix(
+            (
+                np.ones(self._n_edges, dtype=np.float32),
+                (
+                    self._in_edges,
+                    self._n_slack_vars * self._n_nodes + np.arange(self._n_edges),
+                ),
+            ),
+            shape=self._shape,
+        )
+
+        appear = self._sparse_nodes_ids_eye_matrix(offset=1)
+        nodes = self._sparse_nodes_ids_eye_matrix()
+
+        return (in_edges + appear - nodes) @ self._variables == 0
+
+    def _flow_conservation_constraint(self) -> Expression:
+        """Creates a constraint where the number of in coming and out going links plus slack variables must be equal."""
+        nodes = self._sparse_nodes_ids_eye_matrix()
+        disappear = self._sparse_nodes_ids_eye_matrix(offset=2)
+        division = self._sparse_nodes_ids_eye_matrix(offset=3)
+        out_edges = sparse.csr_matrix(
+            (
+                np.ones(self._n_edges, dtype=np.float32),
+                (
+                    self._out_edges,
+                    self._n_slack_vars * self._n_nodes + np.arange(self._n_edges),
+                ),
+            ),
+            shape=self._shape,
+        )
+        return (nodes + division - out_edges - disappear) @ self._variables == 0
+
+    def _division_constraint(self) -> Expression:
+        """Creates constraint where a node must exist for it to divide."""
+
+        nodes = self._sparse_nodes_ids_eye_matrix()
+        division = self._sparse_nodes_ids_eye_matrix(offset=3)
+
+        return (nodes - division) @ self._variables >= 0
 
     def set_standard_constraints(self) -> None:
         """Resets constraints and add biologcal contraints from node class."""
-        self._constraints = sum(
-            (
-                node.constraints
-                for node in tqdm(
-                    self._nodes.values(),
-                    "Adding standard constraints",
-                    total=len(self._nodes),
-                )
-            ),
-            [],
-        )
+        self._constraints = [
+            self._single_in_edge_constraint(),
+            self._flow_conservation_constraint(),
+            self._division_constraint(),
+        ]
 
     def add_overlap_constraints(self, sources: ArrayLike, targets: ArrayLike) -> None:
         """Add constraints such that `source` and `target` can't be present in the same solution.
@@ -187,12 +203,15 @@ class CVXPySolver(BaseSolver):
         target : ArrayLike
             Target nodes indices.
         """
-        self._constraints += [
-            self._nodes[s].node_var + self._nodes[t].node_var <= 1
-            for s, t in tqdm(
-                zip(sources, targets), "Adding overlap constraints", total=len(targets)
-            )
-        ]
+        sources = self._forward_map[np.asarray(sources)]
+        targets = self._forward_map[np.asarray(targets)]
+
+        ones = np.ones(len(targets), dtype=np.float32)
+
+        nodes = self._sparse_nodes_ids_eye_matrix()
+        overlaps = sparse.csr_matrix((ones, (sources, targets)), shape=self._shape)
+
+        self._constraints += [(nodes - overlaps) @ self._variables >= 0]
 
     def enforce_node_to_solution(self, indices: ArrayLike) -> None:
         """Constraints given nodes' variables to 1.
@@ -202,15 +221,14 @@ class CVXPySolver(BaseSolver):
         indices : ArrayLike
             Nodes indices.
         """
-        self._constraints += [self._nodes[i].node_var >= 1 for i in indices]
+        ones = np.ones(len(indices), dtype=np.float32)
+        selected = sparse.csr_matrix((ones, (indices, indices)), shape=self._shape)
+        self._constraints += [selected @ self._variables >= 1]
 
     def optimize(self) -> float:
         """Optimizes cvxpy model."""
         self._problem = cp.Problem(
-            cp.Maximize(
-                cp.sum(self._weights[np.newaxis, ...] @ self._edges)
-                + cp.sum([node.objective for node in self._nodes.values()])
-            ),
+            cp.Maximize(self._weights.T @ self._variables),
             self._constraints,
         )
         # NOTE: see comments regarding ILP solvers in:
@@ -233,9 +251,15 @@ class CVXPySolver(BaseSolver):
                 "cvxpy solver must be optimized before returning solution."
             )
 
-        nodes = [k for k, var in self._nodes.items() if var.node_var.value > 0.5]
-        edges = np.asarray(
-            [k for k, var in zip(self._edges_keys, self._edges) if var.value > 0.5]
-        )
+        nodes = self._backward_map[self._variables.value[: self._n_nodes] > 0.5]
 
+        selected_edges = (
+            self._variables.value[self._n_slack_vars * self._n_nodes :] > 0.5
+        )
+        sources = self._backward_map[self._out_edges[selected_edges]]
+        targets = self._backward_map[self._in_edges[selected_edges]]
+        edges = np.stack(
+            (sources, targets),
+            axis=1,
+        )
         return indices_to_solution_dataframe(nodes, edges)

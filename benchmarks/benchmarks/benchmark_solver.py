@@ -18,7 +18,7 @@ class SolverSuite:
         ],
     ]
 
-    timeout = 120  # 2 mins timeout, problem are not that large
+    timeout = 360  # 5 mins timeout, problem are not that large
 
     # params = length, n_nodes_per_time, n_neighbors, n_overlaps
     param_names = ["solver_class", "params"]
