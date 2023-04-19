@@ -42,7 +42,7 @@ def _compute_dct(
 
 
 @curry
-def _process(
+def link_time_point(
     time: int,
     config: LinkingConfig,
     db_path: str,
@@ -191,7 +191,7 @@ def link(
         clear_linking_data(data_config.database_path)
 
     with multiprocessing_sqlite_lock(data_config) as lock:
-        process = _process(
+        process = link_time_point(
             config=linking_config,
             db_path=data_config.database_path,
             write_lock=lock,

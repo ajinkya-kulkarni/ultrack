@@ -82,6 +82,30 @@ def _process(
     config: SegmentationConfig,
     db_path: str,
     max_segments_per_time: int,
+    write_lock: Optional[fasteners.InterProcessLock],
+) -> None:
+    """
+    This function single functionality is too index (load) the data from the array.
+    See `segment_time_point for documentation.
+    """
+    segment_time_point(
+        time,
+        detection=detection[time],
+        edge=edge[time],
+        config=config,
+        db_path=db_path,
+        max_segments_per_time=max_segments_per_time,
+        write_lock=write_lock,
+    )
+
+
+def segment_time_point(
+    time: int,
+    detection: ArrayLike,
+    edge: ArrayLike,
+    config: SegmentationConfig,
+    db_path: str,
+    max_segments_per_time: int,
     write_lock: Optional[fasteners.InterProcessLock] = None,
 ) -> None:
     """Process `detection` and `edge` of current time and add data to database.
@@ -105,16 +129,15 @@ def _process(
     """
     np.random.seed(time)
 
-    edge_map = edge[time]
     if config.max_noise > 0:
-        noise = np.random.uniform(0, config.max_noise, size=edge_map.shape)
+        noise = np.random.uniform(0, config.max_noise, size=edge.shape)
         # promoting edge_map to smallest float
-        noise = noise.astype(np.result_type(edge_map.dtype, np.float16))
-        edge_map = edge_map + noise
+        noise = noise.astype(np.result_type(edge.dtype, np.float16))
+        edge = edge + noise
 
     hiers = create_hierarchies(
-        detection[time] > config.threshold,
-        edge_map,
+        detection > config.threshold,
+        edge,
         hierarchy_fun=config.ws_hierarchy,
         max_area=config.max_area,
         min_area=config.min_area,
